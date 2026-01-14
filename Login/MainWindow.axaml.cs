@@ -1,8 +1,10 @@
 using System;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
-using System.Windows.Input; // ICommand
+using System.Windows.Input;
 using Avalonia.Controls;
 using Avalonia.Interactivity;
 using Microsoft.EntityFrameworkCore;
@@ -10,26 +12,28 @@ using SystemLogin;
 
 namespace Login;
 
-public partial class MainWindow : Window
+public partial class MainWindow : Window, INotifyPropertyChanged
 {
     private AccountService _accountService;
     private AppDbContext _appDbContext;
-    private Account _currentUser;
+    private Account? _currentUser;
 
-    // ===== Admin tab
-    public ObservableCollection<OrderViewModel> PreviousOrders { get; set; } = new();
-
-    // ===== Create Order tab
+    public ObservableCollection<OrderViewModel> PreviousOrders { get; } = new();
     public ObservableCollection<ProductViewModel> AvailableProducts { get; } = new();
     public ObservableCollection<ProductViewModel> OrderLines { get; } = new();
 
+    public event PropertyChangedEventHandler? PropertyChanged;
+    private void OnPropertyChanged([CallerMemberName] string? name = null)
+        => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+
     public string CurrentUserId => _currentUser?.Username ?? "";
-    public string CurrentUserFirstName { get; set; } = "";
-    public string CurrentUserLastName { get; set; } = "";
+    public bool IsLoggedIn => _currentUser != null;
+    public bool IsLoggedOut => _currentUser == null;
 
     public RelayCommand<ProductViewModel> AddToOrderCommand { get; }
     public RelayCommand<ProductViewModel> RemoveFromOrderCommand { get; }
     public RelayCommand<ProductViewModel> IncreaseQtyCommand { get; }
+    public RelayCommand<ProductViewModel> DecreaseQtyCommand { get; }
     public RelayCommand PlaceOrderCommand { get; }
 
     public MainWindow()
@@ -40,13 +44,17 @@ public partial class MainWindow : Window
         InitializeServices();
         Loaded += OnLoaded;
 
-        // Commands
+        IncreaseQtyCommand = new RelayCommand<ProductViewModel>(p => p.Quantity++);
+        DecreaseQtyCommand = new RelayCommand<ProductViewModel>(p =>
+        {
+            if (p.Quantity > 0)
+                p.Quantity--;
+        });
+
         AddToOrderCommand = new RelayCommand<ProductViewModel>(AddToOrder);
         RemoveFromOrderCommand = new RelayCommand<ProductViewModel>(RemoveFromOrder);
-        IncreaseQtyCommand = new RelayCommand<ProductViewModel>(p => p.Quantity++);
-        PlaceOrderCommand = new RelayCommand(PlaceOrder);
+        PlaceOrderCommand = new RelayCommand(PlaceOrder, () => IsLoggedIn && OrderLines.Any());
 
-        // Dummy produkter
         AvailableProducts.Add(new ProductViewModel("Component A"));
         AvailableProducts.Add(new ProductViewModel("Component B"));
         AvailableProducts.Add(new ProductViewModel("Component C"));
@@ -97,14 +105,16 @@ public partial class MainWindow : Window
         LogoutButton.IsVisible = true;
 
         Log($"{_currentUser.Username} logged in.");
+
         LoginUsername.Text = "";
         LoginPassword.Text = "";
 
-        // Dummy user info til "Create Order"
-        CurrentUserFirstName = "John";
-        CurrentUserLastName = "Doe";
+        OnPropertyChanged(nameof(IsLoggedIn));
+        OnPropertyChanged(nameof(IsLoggedOut));
+        OnPropertyChanged(nameof(CurrentUserId));
 
         LoadOrdersForUser(_currentUser);
+        UpdateCanExecute();
     }
 
     private void LogoutButton_OnClick(object? sender, RoutedEventArgs e)
@@ -112,41 +122,69 @@ public partial class MainWindow : Window
         _currentUser = null;
         PreviousOrders.Clear();
         LogoutButton.IsVisible = false;
+
+        OnPropertyChanged(nameof(IsLoggedIn));
+        OnPropertyChanged(nameof(IsLoggedOut));
+        OnPropertyChanged(nameof(CurrentUserId));
+
         Log("Logged out.");
+        UpdateCanExecute();
     }
 
-    private void ClearLogButton_OnClick(object? sender, RoutedEventArgs e)
+    private void OnGoToLoginClick(object? sender, RoutedEventArgs e)
     {
-        LogOutput.Text = "";
+        MainTabControl.SelectedIndex = 0;
     }
 
-    private async void CreateUserButton_OnClick(object? sender, RoutedEventArgs e)
+    private void AddToOrder(ProductViewModel product)
     {
-        var username = CreateUserUsername.Text;
-        var password = CreateUserPassword.Text;
-        var isAdmin = CreateUserIsAdmin.IsChecked ?? false;
+        if (product.Quantity <= 0) return;
 
-        if (await _accountService.UsernameExistsAsync(username))
+        OrderLines.Add(new ProductViewModel(product.Name, product.Quantity));
+        product.Quantity = 0;
+
+        UpdateCanExecute();
+    }
+
+    private void RemoveFromOrder(ProductViewModel product)
+    {
+        OrderLines.Remove(product);
+        UpdateCanExecute();
+    }
+
+    private async void PlaceOrder()
+    {
+        if (_currentUser == null || !OrderLines.Any())
         {
-            Log($"Username {username} already exists.");
+            Log("No user logged in or order is empty.");
             return;
         }
 
-        await _accountService.NewAccountAsync(username, password, isAdmin);
-        Log($"Created user {username}.");
-    }
+        var order = new Order
+        {
+            AccountId = _currentUser.GetHashCode(),
+            CreatedAt = DateTime.Now,
+            OrderLines = OrderLines.Select(p => new OrderLine
+            {
+                ProductName = p.Name,
+                Quantity = p.Quantity
+            }).ToList()
+        };
 
-    private async void RecreateDatabaseButton_OnClick(object? sender, RoutedEventArgs e)
-    {
-        await _appDbContext.Database.EnsureDeletedAsync();
-        await EnsureDatabaseCreatedWithExampleDataAsync();
-        Log("Database recreated.");
-    }
+        _appDbContext.Orders.Add(order);
+        await _appDbContext.SaveChangesAsync();
 
-    private void OnPlaceOrderClick(object? sender, RoutedEventArgs e)
-    {
-        Log("Opened new order page.");
-        MainTabControl.SelectedIndex = 4; // Gå til "Create Order"
+        Log("Order saved to database:");
+        foreach (var line in order.OrderLines)
+        {
+            Log($" - {line.ProductName} x{line.Quantity}");
+        }
+
+        OrderLines.Clear();
+        LoadOrdersForUser(_currentUser);
+        UpdateCanExecute();
+
+        MainTabControl.SelectedIndex = 2; // Skift til "Database"
     }
 
     private void LoadOrdersForUser(Account user)
@@ -154,7 +192,7 @@ public partial class MainWindow : Window
         PreviousOrders.Clear();
 
         var orders = _appDbContext.Orders
-            .Where(o => o.AccountId == user.GetHashCode()) // Brug rigtig ID hvis muligt
+            .Where(o => o.AccountId == user.GetHashCode())
             .Include(o => o.OrderLines)
             .OrderByDescending(o => o.CreatedAt)
             .ToList();
@@ -165,62 +203,85 @@ public partial class MainWindow : Window
             {
                 OrderId = order.Id,
                 CreatedAt = order.CreatedAt.ToShortDateString(),
-                TotalQuantity = order.OrderLines.Sum(ol => ol.Quantity)
+                TotalQuantity = order.OrderLines.Sum(l => l.Quantity)
             });
         }
     }
 
-    private void AddToOrder(ProductViewModel product)
-    {
-        if (product.Quantity <= 0) return;
-
-        OrderLines.Add(new ProductViewModel(product.Name, product.Quantity));
-        product.Quantity = 0;
-    }
-
-    private void RemoveFromOrder(ProductViewModel product)
-    {
-        OrderLines.Remove(product);
-    }
-
-    private void PlaceOrder()
-    {
-        Log("Order placed:");
-        foreach (var line in OrderLines)
-            Log($" - {line.Name} x{line.Quantity}");
-
-        OrderLines.Clear();
-    }
-
     private void Log(string message)
     {
-        var now = DateTime.Now.ToString("yy-MM-dd HH:mm:ss");
-        LogOutput.Text += $"{now} | {message}\n";
+        LogOutput.Text += $"{DateTime.Now:HH:mm:ss} | {message}\n";
+    }
+
+    private void RecreateDatabaseButton_OnClick(object? sender, RoutedEventArgs e)
+    {
+        _ = _appDbContext.Database.EnsureDeletedAsync();
+        _ = EnsureDatabaseCreatedWithExampleDataAsync();
+        Log("Database recreated.");
+    }
+
+    private void OnPlaceOrderClick(object? sender, RoutedEventArgs e)
+    {
+        Log("Opened new order page.");
+        MainTabControl.SelectedIndex = 3; // Skift til "Create Order"
+    }
+
+    private void ClearLogButton_OnClick(object? sender, RoutedEventArgs e)
+    {
+        LogOutput.Text = "";
+    }
+
+    private void UpdateCanExecute()
+    {
+        PlaceOrderCommand?.RaiseCanExecuteChanged();
+    }
+
+    private void OnButtonClick(object? sender, RoutedEventArgs e)
+    {
+        throw new NotImplementedException();
     }
 }
 
-// ViewModel for ordrer
+// === ViewModels ===
+
 public class OrderViewModel
 {
     public int OrderId { get; set; }
-    public string CreatedAt { get; set; }
+    public string CreatedAt { get; set; } = "";
     public int TotalQuantity { get; set; }
 }
 
-// ViewModel for produkter i Create Order
-public class ProductViewModel
+public class ProductViewModel : INotifyPropertyChanged
 {
     public string Name { get; }
-    public int Quantity { get; set; }
+
+    private int _quantity;
+    public int Quantity
+    {
+        get => _quantity;
+        set
+        {
+            if (_quantity != value)
+            {
+                _quantity = value;
+                OnPropertyChanged();
+            }
+        }
+    }
 
     public ProductViewModel(string name, int quantity = 0)
     {
         Name = name;
         Quantity = quantity;
     }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+    private void OnPropertyChanged([CallerMemberName] string? name = null)
+        => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }
 
-// RelayCommand-klasser
+// === RelayCommand classes ===
+
 public class RelayCommand : ICommand
 {
     private readonly Action _execute;
@@ -235,6 +296,11 @@ public class RelayCommand : ICommand
     public event EventHandler? CanExecuteChanged;
     public bool CanExecute(object? parameter) => _canExecute == null || _canExecute();
     public void Execute(object? parameter) => _execute();
+
+    public void RaiseCanExecuteChanged()
+    {
+        CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+    }
 }
 
 public class RelayCommand<T> : ICommand
@@ -255,4 +321,8 @@ public class RelayCommand<T> : ICommand
         if (parameter is T value)
             _execute(value);
     }
+private void OnButtonClick(object? sender, RoutedEventArgs e)
+{
+    Console.WriteLine("Process order button clicked.");
+}
 }
