@@ -21,7 +21,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public ObservableCollection<OrderViewModel> PreviousOrders { get; } = new();
     public ObservableCollection<ProductViewModel> AvailableProducts { get; } = new();
     public ObservableCollection<ProductViewModel> OrderLines { get; } = new();
+    
+    public ObservableCollection<OrderLine> DatabaseOrderLines { get; } = new();
+    
+    // === Viser seneste ordre i "Database"-fanen ===
+    public ObservableCollection<ProductViewModel> LastOrderProducts { get; } = new();
 
+    public RelayCommand ProcessOrderCommand { get; }
+    
     public event PropertyChangedEventHandler? PropertyChanged;
     private void OnPropertyChanged([CallerMemberName] string? name = null)
         => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
@@ -35,6 +42,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public RelayCommand<ProductViewModel> IncreaseQtyCommand { get; }
     public RelayCommand<ProductViewModel> DecreaseQtyCommand { get; }
     public RelayCommand PlaceOrderCommand { get; }
+
+    private int _selectedTabIndex;
+    public int SelectedTabIndex
+    {
+        get => _selectedTabIndex;
+        set
+        {
+            _selectedTabIndex = value;
+            OnPropertyChanged();
+
+            // 2 = Database-tab
+            if (_selectedTabIndex == 2)
+                LoadLatestOrderFromDatabase();
+        }
+    }
 
     public MainWindow()
     {
@@ -53,7 +75,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         AddToOrderCommand = new RelayCommand<ProductViewModel>(AddToOrder);
         RemoveFromOrderCommand = new RelayCommand<ProductViewModel>(RemoveFromOrder);
-        PlaceOrderCommand = new RelayCommand(PlaceOrder, () => IsLoggedIn && OrderLines.Any());
+        PlaceOrderCommand = new RelayCommand(
+            PlaceOrder,
+            () => IsLoggedIn && OrderLines.Any(p => p.Quantity > 0)
+        );
+
+        ProcessOrderCommand = new RelayCommand(OnConfirmOrderCompleted);
 
         AvailableProducts.Add(new ProductViewModel("Component A"));
         AvailableProducts.Add(new ProductViewModel("Component B"));
@@ -83,9 +110,17 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         await _accountService.NewAccountAsync("user", "user");
         return true;
     }
+    private void OnDatabaseTabSelected()
+    {
+        LoadLatestOrderFromDatabase();
+    }
 
     private async void LoginButton_OnClick(object? sender, RoutedEventArgs e)
     {
+        LoadOrdersForUser(_currentUser);
+        LoadLatestOrderFromDatabase();
+        UpdateCanExecute();
+
         var username = LoginUsername.Text;
         var password = LoginPassword.Text;
 
@@ -112,6 +147,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         OnPropertyChanged(nameof(IsLoggedIn));
         OnPropertyChanged(nameof(IsLoggedOut));
         OnPropertyChanged(nameof(CurrentUserId));
+        UpdateCanExecute();
+
 
         LoadOrdersForUser(_currentUser);
         UpdateCanExecute();
@@ -133,7 +170,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void OnGoToLoginClick(object? sender, RoutedEventArgs e)
     {
-        MainTabControl.SelectedIndex = 0;
+        SelectedTabIndex = 0;
     }
 
     private void AddToOrder(ProductViewModel product)
@@ -156,13 +193,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         if (_currentUser == null || !OrderLines.Any())
         {
-            Log("No user logged in or order is empty.");
+            Log("You must be logged in and have items in the cart.");
             return;
         }
 
         var order = new Order
         {
-            AccountId = _currentUser.GetHashCode(),
+            AccountUsername = _currentUser.Username,
             CreatedAt = DateTime.Now,
             OrderLines = OrderLines.Select(p => new OrderLine
             {
@@ -171,28 +208,59 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             }).ToList()
         };
 
+
         _appDbContext.Orders.Add(order);
         await _appDbContext.SaveChangesAsync();
+        LoadLatestOrderFromDatabase();
 
-        Log("Order saved to database:");
+        Log("Order placed and saved to database.");
+        foreach (var line in order.OrderLines)
+            Log($" - {line.ProductName} x{line.Quantity}");
+
+        // Overfør til databasen-fanen
+        LastOrderProducts.Clear();
+        foreach (var item in OrderLines)
+            LastOrderProducts.Add(new ProductViewModel(item.Name, item.Quantity));
+
+        // Ryd kurven
+        OrderLines.Clear();
+
+        // Genindlæs ordrer
+        LoadOrdersForUser(_currentUser);
+
+        // Skift til "Database"-fanen
+        SelectedTabIndex = 2;
+
+        UpdateCanExecute();
+    }
+
+    private void LoadLatestOrderFromDatabase()
+    {
+        DatabaseOrderLines.Clear();
+
+        var order = _appDbContext.Orders
+            .Include(o => o.OrderLines)
+            .OrderByDescending(o => o.CreatedAt)
+            .FirstOrDefault();
+
+        if (order == null)
+            return;
+
         foreach (var line in order.OrderLines)
         {
-            Log($" - {line.ProductName} x{line.Quantity}");
+            DatabaseOrderLines.Add(line);
         }
-
-        OrderLines.Clear();
-        LoadOrdersForUser(_currentUser);
-        UpdateCanExecute();
-
-        MainTabControl.SelectedIndex = 2; // Skift til "Database"
     }
 
     private void LoadOrdersForUser(Account user)
     {
+        if (user == null || string.IsNullOrEmpty(user.Username))
+            return;
+
         PreviousOrders.Clear();
 
         var orders = _appDbContext.Orders
-            .Where(o => o.AccountId == user.GetHashCode())
+            .Where(o => o.AccountUsername == user.Username)
             .Include(o => o.OrderLines)
             .OrderByDescending(o => o.CreatedAt)
             .ToList();
@@ -208,10 +276,57 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
-    private void Log(string message)
+    private void CreateUserButton_OnClick(object? sender, RoutedEventArgs e)
     {
-        LogOutput.Text += $"{DateTime.Now:HH:mm:ss} | {message}\n";
+        var username = CreateUserUsername.Text;
+        var password = CreateUserPassword.Text;
+        var isAdmin = CreateUserIsAdmin.IsChecked ?? false;
+
+        if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
+        {
+            Log("Username and password are required.");
+            return;
+        }
+
+        if (_accountService.UsernameExistsAsync(username).Result)
+        {
+            Log("Username already exists.");
+            return;
+        }
+
+        _accountService.NewAccountAsync(username, password, isAdmin).Wait();
+        Log($"User '{username}' created (Admin: {isAdmin})");
+
+        CreateUserUsername.Text = "";
+        CreateUserPassword.Text = "";
+        CreateUserIsAdmin.IsChecked = false;
     }
+    private void OnConfirmOrderCompleted()
+    {
+        foreach (var line in DatabaseOrderLines)
+        {
+            for (int i = 0; i < line.Quantity; i++)
+            {
+                switch (line.ProductName)
+                {
+                    case "Component A":
+                        RobotConnectionTest.RunComponentA();
+                        break;
+
+                    case "Component B":
+                        RobotConnectionTest.RunComponentB();
+                        break;
+                    
+                    case "Component C":
+                        RobotConnectionTest.RunComponentC();
+                        break;
+                }
+            }
+        }
+
+        Log("Order sent to robot and executed");
+    }
+
 
     private void RecreateDatabaseButton_OnClick(object? sender, RoutedEventArgs e)
     {
@@ -223,7 +338,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void OnPlaceOrderClick(object? sender, RoutedEventArgs e)
     {
         Log("Opened new order page.");
-        MainTabControl.SelectedIndex = 3; // Skift til "Create Order"
+        SelectedTabIndex = 3;
     }
 
     private void ClearLogButton_OnClick(object? sender, RoutedEventArgs e)
@@ -238,7 +353,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void OnButtonClick(object? sender, RoutedEventArgs e)
     {
-        throw new NotImplementedException();
+        Console.WriteLine("Process order button clicked.");
+    }
+
+    private void Log(string message)
+    {
+        LogOutput.Text += $"{DateTime.Now:HH:mm:ss} | {message}\n";
     }
 }
 
@@ -321,8 +441,9 @@ public class RelayCommand<T> : ICommand
         if (parameter is T value)
             _execute(value);
     }
-private void OnButtonClick(object? sender, RoutedEventArgs e)
-{
-    Console.WriteLine("Process order button clicked.");
-}
+
+    public void RaiseCanExecuteChanged()
+    {
+        CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+    }
 }

@@ -103,20 +103,20 @@ public class Order
     public int Id { get; set; }
 
     public DateTime CreatedAt { get; set; }
-    public string Status { get; set; }
+    public string Status { get; set; } = "Pending";
 
-    public int AccountId { get; set; } // Reference to Account
-    public List<OrderLine> OrderLines { get; set; }
+    public string AccountUsername { get; set; }
+    public List<OrderLine> OrderLines { get; set; } = new();
 }
 
 public class OrderLine
 {
-    [Key]
     public int Id { get; set; }
 
-    public string ComponentType { get; set; }
+    public string ProductName { get; set; } = "";  // ← Denne linje mangler!
     public int Quantity { get; set; }
 
     public int OrderId { get; set; }
-    public Order Order { get; set; }
+    public Order? Order { get; set; }
 }
+
